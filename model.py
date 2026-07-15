@@ -177,35 +177,23 @@ class DinoV2ViT(nn.Module):
         }
 
     # Probe readouts fuse multiple late-layer normalized tokens instead of only the very last
-    # layer: denser patch detail (via edge-aware upsampling guided by input luminance) for the
-    # segmentation head, and multi-depth CLS features (concatenated) for classification/slide
-    # probes. Rationale: the final layer alone is the most DINO/JEPA-head-specialized
-    # representation; fusing a few preceding layers gives probes a broader, less
-    # objective-specific view of what the backbone learned. Uses only standard functional ops
-    # (F.interpolate/avg_pool2d/pad) -- no new learned parameters, so it changes nothing about
-    # training, only how a frozen checkpoint's features are read out.
+    # layer: denser patch detail for the segmentation head, and multi-depth CLS features
+    # (concatenated) for classification/slide probes. Rationale: the final layer alone is the
+    # most DINO/JEPA-head-specialized representation; fusing a few preceding layers gives probes
+    # a broader, less objective-specific view of what the backbone learned. Deliberately stays at
+    # the native patch grid resolution (no upsampling) to keep the memory footprint close to the
+    # original single-layer readout -- an earlier version upsampled to a denser grid with an
+    # edge-aware blend, which OOM'd probe.py's segmentation head on this cluster's system-RAM
+    # budget (~16x the memory per image from 4x channels x 4x spatial). No new learned
+    # parameters, so this changes nothing about training, only how a frozen checkpoint's
+    # features are read out.
     def encode_image(self, x, checkpoint=False):
-        B, _, H, W = x.shape
-        h, w, upsample_grid = H // self.patch_size, W // self.patch_size, 32
-        # Luminance guide map: used to avoid smoothing across tissue edges when upsampling the
-        # coarse patch grid back toward pixel resolution.
-        guide = x.mean(1, keepdim=True)
-        guide = (guide - guide.amin((2, 3), keepdim=True)) / (guide.amax((2, 3), keepdim=True) - guide.amin((2, 3), keepdim=True) + 1e-6)
         tokens, layer_feats = self._prepare_tokens(x), []
         for i, blk in enumerate(self.blocks):
             tokens = torch.utils.checkpoint.checkpoint(blk, tokens, use_reentrant=False) if checkpoint and self.training else blk(tokens)
             if i >= len(self.blocks) - 4:  # fuse the last 4 transformer blocks
                 layer_feats.append(self.norm(tokens)[:, 1:])
-        fused = torch.cat(layer_feats, dim=-1)
-        regs, patches = fused[:, : self.registers], fused[:, self.registers :]
-        patch_grid = patches.transpose(1, 2).reshape(B, patches.shape[-1], h, w).float()
-        upsampled = F.interpolate(patch_grid, size=(upsample_grid, upsample_grid), mode="bilinear", align_corners=False)
-        guide_lr = F.interpolate(guide, size=(h, w), mode="area")
-        guide_hr = F.interpolate(guide, size=(upsample_grid, upsample_grid), mode="area")
-        edge_weight = torch.exp(-((guide_hr - F.interpolate(guide_lr, size=(upsample_grid, upsample_grid), mode="nearest")).abs() ** 2) / 0.02)
-        blurred = F.avg_pool2d(F.pad(upsampled, (1, 1, 1, 1), mode="replicate"), 3, 1)
-        dense = (upsampled + (1 - edge_weight) * (upsampled - blurred)).flatten(2).transpose(1, 2).to(fused.dtype)
-        return torch.cat([regs, dense], dim=1)
+        return torch.cat(layer_feats, dim=-1)  # [registers || patches], channel-fused, native grid
 
     def probe_features(self, x):
         tokens, cls_feats = self._prepare_tokens(x), []
