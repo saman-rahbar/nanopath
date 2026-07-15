@@ -26,7 +26,7 @@ model:
 train:
   seed: 7777
   bf16: true
-  activation_checkpointing: false
+  activation_checkpointing: true # Narval A100s here are 40GB, not the 80GB H100 main.yaml/smoke.yaml were sized for; avoids CUDA OOM
   batch_size: 128
   num_workers: 16
   prefetch_factor: 2
