@@ -63,6 +63,7 @@ dino:
   jepa_blocks: 4
   jepa_block_scale: 0.15
   metadata_gamma_max: 0.7
+  metadata_loss_weight: 0.03
 
 probe:
   enabled: true
@@ -102,4 +103,6 @@ probe:
 
 metadata:
   enabled: true
-  factor: subtype
+  factors:
+    - [subtype, 1.0]
+    - [scanner, -1.0]

@@ -65,6 +65,7 @@ dino:
   jepa_blocks: 4 # number of contiguous mask blocks per image
   jepa_block_scale: 0.15 # area fraction of the patch grid covered per block
   metadata_gamma_max: 0.7 # ceiling of the DANN-style gradient ramp into the encoder for the metadata loss
+  metadata_loss_weight: 0.03 # keeps each metadata factor a gentle auxiliary signal, not a competing objective
 
 probe:
   enabled: true
@@ -103,7 +104,12 @@ probe:
     ucla_lung: /data/ucla-lung
 
 metadata:
-  # Single-factor auxiliary classification on public TCGA clinical metadata (cancer subtype),
-  # not derived from probe.py or benchmarking/. See metadata/README.md for provenance.
+  # Auxiliary classification on public TCGA clinical metadata, not derived from probe.py or
+  # benchmarking/. See metadata/README.md for provenance. Each [factor, sign] pair: sign=+1 (M+)
+  # trains the encoder to predict the factor (subtype: real semantic signal worth encouraging);
+  # sign=-1 (M-) reverses the gradient to train the encoder to NOT predict it (scanner: a
+  # nuisance/robustness-hurting factor worth suppressing, DANN-style).
   enabled: true
-  factor: subtype
+  factors:
+    - [subtype, 1.0]
+    - [scanner, -1.0]

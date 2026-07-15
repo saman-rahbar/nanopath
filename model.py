@@ -256,10 +256,11 @@ class JEPAPredictor(nn.Module):
         return self.proj_out(self.norm(x))
 
 
-# Single-factor metadata-guidance head: a plain linear classifier over the CLS token, predicting
-# a TCGA clinical/genomic covariate (e.g. cancer subtype) that is not derivable from probe.py.
-# Intentionally the simplest possible head (nn.Linear + F.cross_entropy in train.py) rather than
-# a learned prototype bank, to keep the auxiliary objective easy to reason about and debug.
+# Metadata-guidance head: a plain linear classifier over the CLS token, predicting one TCGA
+# clinical/genomic covariate (e.g. cancer subtype, imaging scanner) that is not derivable from
+# probe.py. train.py instantiates one of these per configured factor. Intentionally the simplest
+# possible head (nn.Linear + F.cross_entropy) rather than a learned prototype bank, to keep each
+# auxiliary objective easy to reason about and debug.
 class MetadataClassifier(nn.Module):
     def __init__(self, dim, n_classes):
         super().__init__()

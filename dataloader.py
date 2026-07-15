@@ -19,9 +19,10 @@
 # This file is the *pretraining* input pipeline only. The downstream probes
 # (probe.py) do not import anything from here.
 #
-# Optional single-factor metadata guidance (cfg.metadata.enabled): looks up one TCGA clinical/
-# genomic covariate (e.g. cancer subtype) per patient barcode from metadata/fino_meta.json --
-# already-published, already-vetted public metadata (see metadata/README.md), not derived here.
+# Optional metadata guidance (cfg.metadata.enabled): looks up one or more TCGA clinical/genomic
+# covariates (e.g. cancer subtype, imaging scanner) per patient barcode from
+# metadata/fino_meta.json -- already-published, already-vetted public metadata (see
+# metadata/README.md), not derived here.
 # train.py uses this as an auxiliary classification target; -1 means "no label for this patient".
 
 import hashlib
@@ -131,13 +132,16 @@ class TCGATileDataset(Dataset):
         # Two parallel int32 arrays (~32 MB total for 4M tiles) shared COW across DataLoader fork-workers.
         self.shard_of = np.asarray(in_split_shard, dtype=np.int32)
         self.row_of = np.asarray(in_split_row, dtype=np.int32)
-        # Single-factor metadata guidance: barcode -> class id map, loaded once and shared
-        # copy-on-write across DataLoader fork-workers (same sharing pattern as shard_of/row_of).
+        # Metadata guidance: one barcode -> class id map per configured factor, loaded once and
+        # shared copy-on-write across DataLoader fork-workers (same sharing pattern as
+        # shard_of/row_of). cfg.metadata.factors is a list of [factor_name, sign] pairs; sign is
+        # only used by train.py (M+ encourage / M- suppress via GradScale), not here.
         metadata_cfg = cfg.get("metadata") or {}
         self.metadata_enabled = bool(metadata_cfg.get("enabled"))
         if self.metadata_enabled:
             meta = json.loads((dataset_dir / "fino_meta.json").read_text())
-            self.metadata_factor_labels = meta["discrete"][metadata_cfg["factor"]]
+            self.metadata_factors = [name for name, _ in metadata_cfg["factors"]]
+            self.metadata_factor_labels = {name: meta["discrete"][name] for name in self.metadata_factors}
         mean, std = data["mean"], data["std"]
         self.global_views = int(train["global_views"])
         self.local_views = int(train["local_views"])
@@ -213,13 +217,18 @@ class TCGATileDataset(Dataset):
         # Augmentations are stochastic per view; reproducibility comes from worker seeds.
         global_views = torch.stack([self.global_aug(tile) for _ in range(self.global_views)])
         local_views = torch.stack([self.local_aug(tile) for _ in range(self.local_views)])
-        # -1 = no label for this patient; train.py masks those out of the metadata loss.
-        metadata_label = self.metadata_factor_labels.get(patient_id, -1) if self.metadata_enabled else -1
+        # One label per configured factor, -1 = no label for this patient; train.py masks those
+        # out of that factor's loss term. Fixed factor order (self.metadata_factors) so train.py
+        # can index columns by position.
+        if self.metadata_enabled:
+            metadata_labels = [self.metadata_factor_labels[name].get(patient_id, -1) for name in self.metadata_factors]
+        else:
+            metadata_labels = [-1]
         return {
             "global_views": global_views,
             "local_views": local_views,
             "sample_idx": torch.tensor(int(idx), dtype=torch.int64),
             "slide_id": torch.tensor(slide_key, dtype=torch.int64),
             "patient_id": torch.tensor(patient_key, dtype=torch.int64),
-            "metadata_label": torch.tensor(metadata_label, dtype=torch.int64),
+            "metadata_labels": torch.tensor(metadata_labels, dtype=torch.int64),
         }
