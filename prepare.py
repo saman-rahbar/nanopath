@@ -911,14 +911,15 @@ def main():
         fetch_tiles_from_hf(dataset_dir)
         assert sum(1 for _ in dataset_dir.glob("shard-*.parquet")) == NUM_SHARDS, f"tiles still incomplete after fetch: {dataset_dir}"
 
-    # Stage 1b — single-factor metadata guidance artifact, placed beside the tile dataset where
+    # Stage 1b — metadata guidance artifact, placed beside the tile dataset where
     # dataloader.py/train.py read it. Copies the committed metadata/fino_meta.json (see
     # metadata/README.md for provenance); no build step needed since it's already processed.
+    # Always overwrites rather than skip-if-exists: the file is tiny, and a stale copy silently
+    # missing newly-added factors is worse than a redundant copy.
     if (cfg.get("metadata") or {}).get("enabled"):
         metadata_path = dataset_dir / "fino_meta.json"
-        if not metadata_path.exists():
-            shutil.copy(Path(__file__).parent / "metadata" / "fino_meta.json", metadata_path)
-            print(f"[done] metadata: {metadata_path} (from committed metadata/)", flush=True)
+        shutil.copy(Path(__file__).parent / "metadata" / "fino_meta.json", metadata_path)
+        print(f"[done] metadata: {metadata_path} (from committed metadata/)", flush=True)
 
     # Stage 2 — probe datasets. Verify-only collects every gap and reports
     # them all at once so the user fixes the YAML in a single edit.
