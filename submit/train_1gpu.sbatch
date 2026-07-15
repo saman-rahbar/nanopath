@@ -6,8 +6,10 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --output=slurm/%j.out
 #SBATCH --error=slurm/%j.err
-#SBATCH --partition=n
-#SBATCH --qos=normal # low | normal | top
+#SBATCH --account=def-ssfels
+#SBATCH --gres=gpu:a100:1 # train.bf16=true in configs/*.yaml needs Ampere+ (sm80); v100 (Volta) has no native bf16
+#SBATCH --mem=64G # system RAM for the 16 dataloader workers, not GPU VRAM (that's --gres)
+#SBATCH --time=06:00:00 # configs/main.yaml budget on a single A100; smoke.yaml finishes in minutes and exits early
 
 set -euo pipefail
 
@@ -20,6 +22,8 @@ CONFIG_FILE="${1:-${REPO_DIR}/configs/main.yaml}"
 [[ $# -gt 0 ]] && shift
 
 cd "${REPO_DIR}"
+# Narval modules aren't persistent across sessions/jobs; load them every time.
+module load StdEnv/2023 gcc/12.3 cuda/12.2 cudnn/8.9 arrow/21.0.0 python/3.11
 # Worktrees share the venv from the main checkout at /admin/home/$USER/nanopath.
 VENV_DIR="${REPO_DIR}/.venv"
 if [[ ! -f "${VENV_DIR}/bin/activate" ]]; then
