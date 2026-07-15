@@ -23,6 +23,8 @@ CONFIG_FILE="${1:-${REPO_DIR}/configs/main.yaml}"
 cd "${REPO_DIR}"
 # Narval modules aren't persistent across sessions/jobs; load them every time.
 module load StdEnv/2023 gcc/12.3 cuda/12.2 cudnn/8.9 arrow/21.0.0 python/3.11
+# Default to offline W&B so a lost shell export can't crash the job on wandb.init(); override by exporting WANDB_MODE=online beforehand.
+export WANDB_MODE="${WANDB_MODE:-offline}"
 # Worktrees share the venv from the main checkout at /admin/home/$USER/nanopath.
 VENV_DIR="${REPO_DIR}/.venv"
 if [[ ! -f "${VENV_DIR}/bin/activate" ]]; then
