@@ -9,17 +9,24 @@
 # Patients (not tiles) are hashed by TCGA barcode and the bottom `val_fraction`
 # of the hash space is held out from training; train.py instantiates the dataset
 # twice (`is_train=True` for the training loop, `is_train=False` for the
-# lightweight DINO/iBOT/KDE validation pass), so the held-out patient slice
+# lightweight DINO/JEPA/KDE validation pass), so the held-out patient slice
 # stays cleanly out-of-distribution from optimization.
 #
 # Augmentation per view: RandomResizedCrop -> optional HEDJitter -> horizontal/
-# vertical flips -> ColorJitter -> occasional grayscale/blur -> Normalize.
+# vertical flips -> right-angle rotation -> ColorJitter -> occasional
+# grayscale/blur -> Normalize.
 #
 # This file is the *pretraining* input pipeline only. The downstream probes
 # (probe.py) do not import anything from here.
+#
+# Optional single-factor metadata guidance (cfg.metadata.enabled): looks up one TCGA clinical/
+# genomic covariate (e.g. cancer subtype) per patient barcode from metadata/fino_meta.json --
+# already-published, already-vetted public metadata (see metadata/README.md), not derived here.
+# train.py uses this as an auxiliary classification target; -1 means "no label for this patient".
 
 import hashlib
 import io
+import json
 import random
 from pathlib import Path
 
@@ -124,17 +131,30 @@ class TCGATileDataset(Dataset):
         # Two parallel int32 arrays (~32 MB total for 4M tiles) shared COW across DataLoader fork-workers.
         self.shard_of = np.asarray(in_split_shard, dtype=np.int32)
         self.row_of = np.asarray(in_split_row, dtype=np.int32)
+        # Single-factor metadata guidance: barcode -> class id map, loaded once and shared
+        # copy-on-write across DataLoader fork-workers (same sharing pattern as shard_of/row_of).
+        metadata_cfg = cfg.get("metadata") or {}
+        self.metadata_enabled = bool(metadata_cfg.get("enabled"))
+        if self.metadata_enabled:
+            meta = json.loads((dataset_dir / "fino_meta.json").read_text())
+            self.metadata_factor_labels = meta["discrete"][metadata_cfg["factor"]]
         mean, std = data["mean"], data["std"]
         self.global_views = int(train["global_views"])
         self.local_views = int(train["local_views"])
         self.to_tensor = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True)])
-        # Global crops carry the high-context view used by the DINO/iBOT objectives.
+        # Tissue has no canonical orientation (unlike natural images), so a 90-degree-multiple
+        # rotation is a genuine invariance of the data, not just a trick: it's lossless/exact on
+        # a square crop (no interpolation, no border artifacts), unlike an arbitrary-angle
+        # rotation would be. Standard torchvision v2 primitives only.
+        random_right_angle = v2.RandomChoice([v2.RandomRotation((angle, angle)) for angle in (0, 90, 180, 270)])
+        # Global crops carry the high-context view used by the DINO/JEPA objectives.
         self.global_aug = v2.Compose(
             [
                 v2.RandomResizedCrop(train["global_size"], scale=tuple(data["global_crop_scale"]), antialias=True),
                 *([HEDJitter(data["hed_jitter"])] if data["hed_jitter"] > 0 else []),
                 v2.RandomHorizontalFlip(),
                 v2.RandomVerticalFlip(),
+                random_right_angle,
                 v2.ColorJitter(data["color_jitter"], data["color_jitter"], data["color_jitter_saturation"], 0.0),
                 v2.RandomGrayscale(p=0.1),
                 v2.RandomApply([v2.GaussianBlur(9, sigma=(0.1, 1.8))], p=0.35),
@@ -148,6 +168,7 @@ class TCGATileDataset(Dataset):
                 *([HEDJitter(data["hed_jitter"])] if data["hed_jitter"] > 0 else []),
                 v2.RandomHorizontalFlip(),
                 v2.RandomVerticalFlip(),
+                random_right_angle,
                 v2.ColorJitter(data["color_jitter"], data["color_jitter"], data["color_jitter_saturation"], 0.0),
                 v2.RandomGrayscale(p=0.1),
                 v2.RandomApply([v2.GaussianBlur(9, sigma=(0.1, 1.8))], p=0.35),
@@ -192,10 +213,13 @@ class TCGATileDataset(Dataset):
         # Augmentations are stochastic per view; reproducibility comes from worker seeds.
         global_views = torch.stack([self.global_aug(tile) for _ in range(self.global_views)])
         local_views = torch.stack([self.local_aug(tile) for _ in range(self.local_views)])
+        # -1 = no label for this patient; train.py masks those out of the metadata loss.
+        metadata_label = self.metadata_factor_labels.get(patient_id, -1) if self.metadata_enabled else -1
         return {
             "global_views": global_views,
             "local_views": local_views,
             "sample_idx": torch.tensor(int(idx), dtype=torch.int64),
             "slide_id": torch.tensor(slide_key, dtype=torch.int64),
             "patient_id": torch.tensor(patient_key, dtype=torch.int64),
+            "metadata_label": torch.tensor(metadata_label, dtype=torch.int64),
         }

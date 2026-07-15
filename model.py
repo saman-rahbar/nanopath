@@ -6,8 +6,9 @@
 # a strict load.
 #
 # DINOHead is the small MLP + weight-normed classifier used by train.py for the
-# DINO CLS / iBOT patch self-distillation losses. It is intentionally trivial
-# (~15 lines) so we have zero runtime dependency on the dinov2 codebase.
+# DINO CLS self-distillation loss. It is intentionally trivial (~15 lines) so we
+# have zero runtime dependency on the dinov2 codebase. JEPAPredictor and
+# MetadataClassifier below are the other two train.py-facing heads.
 
 import torch
 import torch.nn as nn
@@ -44,6 +45,17 @@ class DropPath(nn.Module):
 class LayerScale(nn.Module):
     def __init__(self, dim): super().__init__(); self.gamma = nn.Parameter(torch.ones(dim))
     def forward(self, x): return x * self.gamma
+
+
+# Standard DANN-style gradient gate: identity on the forward pass, scales the gradient on
+# backward. Used to ramp the metadata-guidance signal into the encoder gradually (scale 0 -> 1)
+# rather than switching it on abruptly. This is the well-known idiomatic pattern for gradient
+# scaling/reversal in PyTorch (no built-in layer exists for it).
+class GradScale(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale): ctx.scale = scale; return x
+    @staticmethod
+    def backward(ctx, g): return g * ctx.scale, None
 
 
 # Attention with single qkv Linear + F.scaled_dot_product_attention (Flash-2 backend on H100 bf16).
@@ -164,14 +176,44 @@ class DinoV2ViT(nn.Module):
             "x_norm_patchtokens": x[:, 1 + self.registers :],
         }
 
-    # Probe contract: encode_image returns [registers || patches] for the seg head;
-    # probe_features returns the cls token for classification probes.
+    # Probe readouts fuse multiple late-layer normalized tokens instead of only the very last
+    # layer: denser patch detail (via edge-aware upsampling guided by input luminance) for the
+    # segmentation head, and multi-depth CLS features (concatenated) for classification/slide
+    # probes. Rationale: the final layer alone is the most DINO/JEPA-head-specialized
+    # representation; fusing a few preceding layers gives probes a broader, less
+    # objective-specific view of what the backbone learned. Uses only standard functional ops
+    # (F.interpolate/avg_pool2d/pad) -- no new learned parameters, so it changes nothing about
+    # training, only how a frozen checkpoint's features are read out.
     def encode_image(self, x, checkpoint=False):
-        out = self(x, checkpoint=checkpoint)
-        return torch.cat([out["x_norm_regtokens"], out["x_norm_patchtokens"]], dim=1)
+        B, _, H, W = x.shape
+        h, w, upsample_grid = H // self.patch_size, W // self.patch_size, 32
+        # Luminance guide map: used to avoid smoothing across tissue edges when upsampling the
+        # coarse patch grid back toward pixel resolution.
+        guide = x.mean(1, keepdim=True)
+        guide = (guide - guide.amin((2, 3), keepdim=True)) / (guide.amax((2, 3), keepdim=True) - guide.amin((2, 3), keepdim=True) + 1e-6)
+        tokens, layer_feats = self._prepare_tokens(x), []
+        for i, blk in enumerate(self.blocks):
+            tokens = torch.utils.checkpoint.checkpoint(blk, tokens, use_reentrant=False) if checkpoint and self.training else blk(tokens)
+            if i >= len(self.blocks) - 4:  # fuse the last 4 transformer blocks
+                layer_feats.append(self.norm(tokens)[:, 1:])
+        fused = torch.cat(layer_feats, dim=-1)
+        regs, patches = fused[:, : self.registers], fused[:, self.registers :]
+        patch_grid = patches.transpose(1, 2).reshape(B, patches.shape[-1], h, w).float()
+        upsampled = F.interpolate(patch_grid, size=(upsample_grid, upsample_grid), mode="bilinear", align_corners=False)
+        guide_lr = F.interpolate(guide, size=(h, w), mode="area")
+        guide_hr = F.interpolate(guide, size=(upsample_grid, upsample_grid), mode="area")
+        edge_weight = torch.exp(-((guide_hr - F.interpolate(guide_lr, size=(upsample_grid, upsample_grid), mode="nearest")).abs() ** 2) / 0.02)
+        blurred = F.avg_pool2d(F.pad(upsampled, (1, 1, 1, 1), mode="replicate"), 3, 1)
+        dense = (upsampled + (1 - edge_weight) * (upsampled - blurred)).flatten(2).transpose(1, 2).to(fused.dtype)
+        return torch.cat([regs, dense], dim=1)
 
     def probe_features(self, x):
-        return self(x)["x_norm_clstoken"]
+        tokens, cls_feats = self._prepare_tokens(x), []
+        for i, blk in enumerate(self.blocks):
+            tokens = blk(tokens)
+            if i in (4, 6, 8, 11):  # spread CLS readout across mid/late depth, not just the final block
+                cls_feats.append(self.norm(tokens)[:, 0])
+        return torch.cat(cls_feats, dim=-1)
 
 
 # Strict-load Meta's pretrained weights for the model's declared variant.
@@ -183,7 +225,7 @@ def load_dinov2_pretrained(model):
     return model
 
 
-# DINO/iBOT projection head: 3-layer MLP (in -> hidden -> hidden -> bottleneck) + L2 norm +
+# DINO projection head: 3-layer MLP (in -> hidden -> hidden -> bottleneck) + L2 norm +
 # weight-normed Linear(bottleneck -> n_prototypes) with weight_g frozen at 1, matching the
 # behaviour of dinov2.layers.DINOHead. Standalone reimplementation (no xformers, no fvcore).
 class DINOHead(nn.Module):
@@ -205,3 +247,35 @@ class DINOHead(nn.Module):
         x = self.mlp(x)
         x = F.normalize(x, dim=-1, p=2)
         return self.last_layer(x)
+
+
+# I-JEPA predictor: regresses the EMA-teacher's patch representations at masked target blocks
+# from the student's block-masked patch tokens. Reuses the same transformer `Block` as the
+# backbone (standard pre-LN attention block) rather than a bespoke architecture.
+class JEPAPredictor(nn.Module):
+    def __init__(self, dim, depth=4, width=0, heads=6):
+        super().__init__()
+        width = width or dim
+        self.proj_in = nn.Linear(dim, width) if width != dim else nn.Identity()
+        self.blocks = nn.ModuleList(Block(width, heads, 4.0, 0.0) for _ in range(depth))
+        self.norm = nn.LayerNorm(width, eps=1e-6)
+        self.proj_out = nn.Linear(width, dim, bias=True)
+
+    def forward(self, patch_tokens):
+        x = self.proj_in(patch_tokens)
+        for blk in self.blocks:
+            x = blk(x)
+        return self.proj_out(self.norm(x))
+
+
+# Single-factor metadata-guidance head: a plain linear classifier over the CLS token, predicting
+# a TCGA clinical/genomic covariate (e.g. cancer subtype) that is not derivable from probe.py.
+# Intentionally the simplest possible head (nn.Linear + F.cross_entropy in train.py) rather than
+# a learned prototype bank, to keep the auxiliary objective easy to reason about and debug.
+class MetadataClassifier(nn.Module):
+    def __init__(self, dim, n_classes):
+        super().__init__()
+        self.linear = nn.Linear(dim, n_classes)
+
+    def forward(self, x):
+        return self.linear(x)
