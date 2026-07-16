@@ -128,6 +128,11 @@ class DinoV2ViT(nn.Module):
         self.patch_embed = nn.Module()
         self.patch_embed.proj = nn.Conv2d(3, dim, kernel_size=patch, stride=patch, bias=True)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        # Dedicated token the metadata-guidance heads read from during training (see train.py).
+        # Keeping molecular/clinical prediction off the CLS token lets it inform the shared trunk
+        # through attention without distorting the CLS geometry the probes depend on. Not in Meta's
+        # checkpoint; load_dinov2_pretrained initialises it from cls_token. No probe reads it.
+        self.metadata_token = nn.Parameter(torch.zeros(1, 1, dim))
         self.register_tokens = nn.Parameter(torch.zeros(1, registers, dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, int(self._pos_has_cls) + self._pretrain_grid**2, dim))
         self.mask_token = nn.Parameter(torch.zeros(1, dim))
@@ -145,7 +150,9 @@ class DinoV2ViT(nn.Module):
         patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, h * w, -1).to(self.pos_embed.dtype)
         return torch.cat([cls_pos, patch_pos], dim=1) if cls_pos is not None else patch_pos
 
-    # Build [cls, registers, patches] tokens; iBOT swaps the masked patch positions for mask_token.
+    # Build [cls, metadata, registers, patches] tokens; masked patch positions become mask_token.
+    # The metadata token sits right after cls (no pos embed, like the registers) and only exists so
+    # the metadata heads have a dedicated readout; it attends over the whole sequence like a register.
     def _prepare_tokens(self, x, masks=None):
         B, _, H, W = x.shape
         h, w = H // self.patch_size, W // self.patch_size
@@ -153,11 +160,12 @@ class DinoV2ViT(nn.Module):
         if masks is not None:
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).expand_as(x), x)
         cls = self.cls_token.expand(B, -1, -1)
+        meta = self.metadata_token.expand(B, -1, -1)
         regs = self.register_tokens.expand(B, -1, -1)
         if self._pos_has_cls:
             x = torch.cat([cls, x], dim=1) + self._interpolate_pos_embed(h, w)
-            return torch.cat([x[:, :1], regs, x[:, 1:]], dim=1)
-        return torch.cat([cls, regs, x + self._interpolate_pos_embed(h, w)], dim=1)
+            return torch.cat([x[:, :1], meta, regs, x[:, 1:]], dim=1)
+        return torch.cat([cls, meta, regs, x + self._interpolate_pos_embed(h, w)], dim=1)
 
     # Returns the dict shape Meta's `forward_features` returns; used by train.py and probe.py.
     # `checkpoint=True` re-runs each block under torch.utils.checkpoint to trade compute for memory;
@@ -172,8 +180,9 @@ class DinoV2ViT(nn.Module):
         x = self.norm(x)
         return {
             "x_norm_clstoken": x[:, 0],
-            "x_norm_regtokens": x[:, 1 : 1 + self.registers],
-            "x_norm_patchtokens": x[:, 1 + self.registers :],
+            "x_norm_metatoken": x[:, 1],
+            "x_norm_regtokens": x[:, 2 : 2 + self.registers],
+            "x_norm_patchtokens": x[:, 2 + self.registers :],
         }
 
     # Probe readouts fuse multiple late-layer normalized tokens instead of only the very last
@@ -192,7 +201,7 @@ class DinoV2ViT(nn.Module):
         for i, blk in enumerate(self.blocks):
             tokens = torch.utils.checkpoint.checkpoint(blk, tokens, use_reentrant=False) if checkpoint and self.training else blk(tokens)
             if i >= len(self.blocks) - 4:  # fuse the last 4 transformer blocks
-                layer_feats.append(self.norm(tokens)[:, 1:])
+                layer_feats.append(self.norm(tokens)[:, 2:])  # drop cls(0) + metadata(1), keep [regs, patches]
         return torch.cat(layer_feats, dim=-1)  # [registers || patches], channel-fused, native grid
 
     def probe_features(self, x):
@@ -204,12 +213,16 @@ class DinoV2ViT(nn.Module):
         return torch.cat(cls_feats, dim=-1)
 
 
-# Strict-load Meta's pretrained weights for the model's declared variant.
-# Strict matches our key layout against Meta's; any drift fails loudly per AGENTS.md.
+# Load Meta's pretrained weights for the model's declared variant. Our added metadata_token is the
+# one parameter absent from Meta's checkpoint, so we assert it is the ONLY drift (preserving the
+# fail-loud contract for any other mismatch) and initialise it from the loaded cls_token.
 def load_dinov2_pretrained(model):
     *_, url = DINOV2_VARIANTS[model.variant]
     state = torch.hub.load_state_dict_from_url(url, progress=False, map_location="cpu")
-    model.load_state_dict(state, strict=True)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    assert missing == ["metadata_token"] and not unexpected, f"unexpected checkpoint drift: missing={missing} unexpected={unexpected}"
+    with torch.no_grad():
+        model.metadata_token.copy_(model.cls_token)
     return model
 
 

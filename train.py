@@ -478,25 +478,27 @@ def main():
         metadata_loss = sg["x_norm_clstoken"].new_zeros(())
         if meta is not None:
             gamma, labels, conts = meta
-            cls = sg["x_norm_clstoken"]
-            # metadata_loss_weight keeps each factor a gentle auxiliary signal relative to the main
-            # dino/jepa objectives, not a competing one -- round 2 omitted this and the unweighted
-            # metadata loss reached dino+jepa+kde magnitude, hurting the primary representation.
-            # GradScale ramps the encoder gradient in gradually (gamma: 0 -> gamma_max), sign flips
-            # it: +1 (M+) encourages predicting the factor, -1 (M-) reverses to suppress it.
+            # Read the dedicated metadata token, NOT the CLS: this keeps the molecular/clinical
+            # prediction pressure off the CLS geometry the probes depend on, while biology still
+            # informs the shared trunk through attention. metadata_loss_weight keeps each factor a
+            # gentle auxiliary signal (round 2 omitted it and the unweighted loss reached
+            # dino+jepa+kde magnitude, hurting the representation). GradScale ramps the encoder
+            # gradient in gradually (gamma: 0 -> gamma_max); sign flips it: +1 (M+) encourages
+            # predicting the factor, -1 (M-) reverses to suppress it.
+            meta_feat = sg["x_norm_metatoken"]
             weight = dino_cfg["metadata_loss_weight"]
             labels = labels.repeat(train_cfg["global_views"], 1)
             for j, (name, sign) in enumerate(metadata_discrete):
                 col = labels[:, j]
                 valid = col >= 0
                 if valid.any():
-                    logits = student_metadata_heads[name](GradScale.apply(cls[valid], sign * gamma))
+                    logits = student_metadata_heads[name](GradScale.apply(meta_feat[valid], sign * gamma))
                     metadata_loss = metadata_loss + weight * F.cross_entropy(logits, col[valid])
             for name, sign in metadata_continuous:
                 target = conts[name].repeat(train_cfg["global_views"], 1)
                 valid = ~torch.isnan(target).any(dim=1)
                 if valid.any():
-                    pred = student_metadata_heads[name](GradScale.apply(cls[valid], sign * gamma))
+                    pred = student_metadata_heads[name](GradScale.apply(meta_feat[valid], sign * gamma))
                     metadata_loss = metadata_loss + weight * F.smooth_l1_loss(pred, target[valid])
         return local_loss + global_loss, jepa_loss, kde, metadata_loss
 
