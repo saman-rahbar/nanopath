@@ -10,6 +10,8 @@
 # have zero runtime dependency on the dinov2 codebase. JEPAPredictor and
 # MetadataClassifier below are the other two train.py-facing heads.
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,8 +27,13 @@ DINOV2_VARIANTS = {
 
 
 def probe_transforms():
-    # Default for Nanopath-trained checkpoints; baseline scripts override this in their request config.
-    transform = transforms.Compose([transforms.Resize((224, 224), antialias=True), transforms.ToTensor()])
+    # Probe at the resolution the backbone was trained at. train.py exports NANOPATH_PROBE_SIZE from
+    # train.global_size, and probe.py evaluates in a subprocess that inherits os.environ, so this
+    # tracks automatically (default 224 = the historical behaviour). Matching train/probe scale
+    # matters: the ViT's token grid and the runtime-interpolated pos-embed both depend on input
+    # size, so probing at a different resolution than training degrades the frozen features.
+    size = int(os.environ.get("NANOPATH_PROBE_SIZE", 224))
+    transform = transforms.Compose([transforms.Resize((size, size), antialias=True), transforms.ToTensor()])
     # Keep the two return slots because probe.py separates tile-image and slide/patch-bag probes.
     return transform, transform
 

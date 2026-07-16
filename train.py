@@ -249,6 +249,9 @@ def main():
     metadata_enabled = bool(metadata_cfg.get("enabled"))
     metadata_discrete = [(name, float(sign)) for name, sign in metadata_cfg.get("discrete", [])] if metadata_enabled else []
     metadata_continuous = [(name, float(sign)) for name, sign in metadata_cfg.get("continuous", [])] if metadata_enabled else []
+    # Probe at the training resolution: probe.py evaluates in a subprocess that inherits os.environ
+    # and calls model.probe_transforms(), which reads this. Keeps train/probe input scale matched.
+    os.environ["NANOPATH_PROBE_SIZE"] = str(int(train_cfg["global_size"]))
     save_every = train_cfg["save_every"]
     save_checkpoints = save_every is not None
     device = torch.device("cuda")

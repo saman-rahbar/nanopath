@@ -115,8 +115,13 @@ class TCGATileDataset(Dataset):
                 f"`python prepare.py {cfg['config_path']} download=True` to fetch them from "
                 f"the medarc/nanopath HF dataset before training."
             )
-        if int(train["global_size"]) > TILE_SIZE:
-            raise ValueError(f"global_size must be <= {TILE_SIZE}, got global_size={train['global_size']}")
+        # global_size > TILE_SIZE upsamples the crop. That adds no optical detail (the source tile is
+        # TILE_SIZE), but it gives the ViT a finer token grid over the same tissue -- each 14px patch
+        # then covers fewer source pixels, which is nuclei-scale rather than several-nuclei-scale.
+        # The run is sample-capped (1M tiles) well before the 1e18 FLOP cap, so the extra tokens are
+        # spare budget. model.probe_transforms() tracks train.global_size so probing stays matched.
+        if int(train["global_size"]) > 2 * TILE_SIZE:
+            raise ValueError(f"global_size must be <= {2 * TILE_SIZE} (2x source tile), got global_size={train['global_size']}")
         # Lazy ParquetFile handles, opened on first __getitem__ in each worker
         # so fork-children own their own file positions.
         self._readers = [None] * len(self.shards)
