@@ -72,22 +72,27 @@ def patient_id_from_relpath(rel):
     return "-".join(rel.split("/", 1)[0].split("-")[:3])
 
 
-# Lightweight stain-space jitter; this is the stain augmentation hook for pretraining tiles.
+# Stain-space jitter; the stain augmentation hook for pretraining tiles. When sigma_hi > sigma the
+# per-image perturbation strength is itself drawn ~ U(sigma, sigma_hi) (RandStainNA-style: random
+# stain-augmentation strength gives heavier, more realistic scanner/stain diversity, which improves
+# cross-site robustness). sigma_hi <= sigma (the default) reproduces the fixed-strength behaviour exactly.
 class HEDJitter(nn.Module):
     # Store conversion matrices as buffers so transforms move with the module dtype/device if needed.
-    def __init__(self, sigma):
+    def __init__(self, sigma, sigma_hi=None):
         super().__init__()
         self.sigma = sigma
+        self.sigma_hi = sigma_hi if (sigma_hi and sigma_hi > sigma) else None
         self.register_buffer("hed_from_rgb", HED_FROM_RGB)
         self.register_buffer("rgb_from_hed", RGB_FROM_HED)
 
     # Perturb HED channels, then convert back to RGB while the crop is still in [0, 1].
     def forward(self, x):
+        sigma = self.sigma if self.sigma_hi is None else float(torch.empty(()).uniform_(self.sigma, self.sigma_hi))
         rgb = x.permute(1, 2, 0).clamp_min(1e-6)
         hed = (torch.log(rgb) / LOG_1E6) @ self.hed_from_rgb.to(dtype=x.dtype)
         hed = hed.clamp_min(0.0)
-        shift = torch.randn((1, 1, 3), dtype=x.dtype) * self.sigma
-        scale = 1.0 + torch.randn((1, 1, 3), dtype=x.dtype) * self.sigma
+        shift = torch.randn((1, 1, 3), dtype=x.dtype) * sigma
+        scale = 1.0 + torch.randn((1, 1, 3), dtype=x.dtype) * sigma
         hed = hed * scale + shift
         log_rgb = -(hed * (-LOG_1E6)) @ self.rgb_from_hed.to(dtype=x.dtype)
         return torch.exp(log_rgb).clamp_(0.0, 1.0).permute(2, 0, 1)
@@ -159,7 +164,7 @@ class TCGATileDataset(Dataset):
         self.global_aug = v2.Compose(
             [
                 v2.RandomResizedCrop(train["global_size"], scale=tuple(data["global_crop_scale"]), antialias=True),
-                *([HEDJitter(data["hed_jitter"])] if data["hed_jitter"] > 0 else []),
+                *([HEDJitter(data["hed_jitter"], data.get("hed_jitter_hi"))] if data["hed_jitter"] > 0 else []),
                 v2.RandomHorizontalFlip(),
                 v2.RandomVerticalFlip(),
                 random_right_angle,
@@ -173,7 +178,7 @@ class TCGATileDataset(Dataset):
         self.local_aug = v2.Compose(
             [
                 v2.RandomResizedCrop(train["local_size"], scale=tuple(data["local_crop_scale"]), antialias=True),
-                *([HEDJitter(data["hed_jitter"])] if data["hed_jitter"] > 0 else []),
+                *([HEDJitter(data["hed_jitter"], data.get("hed_jitter_hi"))] if data["hed_jitter"] > 0 else []),
                 v2.RandomHorizontalFlip(),
                 v2.RandomVerticalFlip(),
                 random_right_angle,
