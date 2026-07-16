@@ -137,6 +137,18 @@ class TCGATileDataset(Dataset):
         # Two parallel int32 arrays (~32 MB total for 4M tiles) shared COW across DataLoader fork-workers.
         self.shard_of = np.asarray(in_split_shard, dtype=np.int32)
         self.row_of = np.asarray(in_split_row, dtype=np.int32)
+        # Optional semantic curation (train only): restrict the index to the deduplicated subset
+        # in data.curation_manifest (produced by curate.py). Spends the fixed 1M-presentation
+        # budget on more-informative, less-redundant tiles. Intersect rather than trust the
+        # manifest blindly so a stale manifest (built at a different split) fails loud on emptiness.
+        if is_train and data.get("curation_manifest"):
+            m = np.load(data["curation_manifest"])
+            keep = set(zip(m["shard_of"].tolist(), m["row_of"].tolist()))
+            sel = np.array([(int(s), int(r)) in keep for s, r in zip(self.shard_of, self.row_of)], dtype=bool)
+            if not sel.any():
+                raise ValueError(f"curation_manifest {data['curation_manifest']} matched 0 tiles; rebuild it for split_seed={data['split_seed']}")
+            print(f"[data] curation: {int(sel.sum())}/{len(sel)} tiles kept from {data['curation_manifest']}", flush=True)
+            self.shard_of, self.row_of = self.shard_of[sel], self.row_of[sel]
         # Metadata guidance: barcode -> value maps loaded once and shared copy-on-write across
         # DataLoader fork-workers (same sharing pattern as shard_of/row_of). cfg.metadata has two
         # lists of [factor_name, sign] pairs: `discrete` (categorical -> class-id, cross-entropy)
