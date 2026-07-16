@@ -104,12 +104,17 @@ probe:
     ucla_lung: /data/ucla-lung
 
 metadata:
-  # Auxiliary classification on public TCGA clinical metadata, not derived from probe.py or
-  # benchmarking/. See metadata/README.md for provenance. Each [factor, sign] pair: sign=+1 (M+)
-  # trains the encoder to predict the factor (subtype: real semantic signal worth encouraging);
-  # sign=-1 (M-) reverses the gradient to train the encoder to NOT predict it (scanner: a
-  # nuisance/robustness-hurting factor worth suppressing, DANN-style).
+  # Auxiliary guidance on public TCGA clinical/genomic metadata, not derived from probe.py or
+  # benchmarking/. See metadata/README.md for provenance. [factor, sign]: sign=+1 (M+) trains the
+  # encoder to predict the factor; -1 (M-) reverses the gradient to suppress it (DANN-style).
+  # Round 3 uses positive molecular grounding: subtype (morphological class), expr512 (512-dim
+  # gene-expression signature), and fga (fraction genome altered). Gene expression / genomic
+  # instability are measured from bulk assay independent of the H&E scanner, so predicting them
+  # anchors the encoder to scanner-invariant biology -- which lifts the robustness / mutation /
+  # survival / progression axes where the FINO frontier out-scores a vision-only recipe.
   enabled: true
-  factors:
+  discrete:
     - [subtype, 1.0]
-    - [scanner, -1.0]
+  continuous:
+    - [expr512, 1.0]
+    - [fga, 1.0]

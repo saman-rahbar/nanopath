@@ -103,6 +103,8 @@ probe:
 
 metadata:
   enabled: true
-  factors:
+  discrete:
     - [subtype, 1.0]
-    - [scanner, -1.0]
+  continuous:
+    - [expr512, 1.0]
+    - [fga, 1.0]

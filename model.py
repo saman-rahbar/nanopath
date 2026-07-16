@@ -268,3 +268,19 @@ class MetadataClassifier(nn.Module):
 
     def forward(self, x):
         return self.linear(x)
+
+
+# Metadata-guidance regressor for CONTINUOUS covariates (e.g. gene-expression signature expr512,
+# fraction-genome-altered fga). A small MLP over the CLS token predicting a z-scored target vector.
+# Rationale for the whole mechanism: gene expression / genomic-instability come from bulk molecular
+# assay of the tumor, independent of the H&E scanner/stain, so regressing them (M+) anchors the
+# encoder to scanner-invariant biology -- a positive-grounding alternative to adversarial scanner
+# removal. train.py pairs this with F.smooth_l1_loss (robust to expression outliers) on the rows
+# that actually have a value for the factor.
+class MetadataRegressor(nn.Module):
+    def __init__(self, dim, out_dim):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(dim, 512), nn.GELU(), nn.Linear(512, 256), nn.GELU(), nn.Linear(256, out_dim))
+
+    def forward(self, x):
+        return self.mlp(x)

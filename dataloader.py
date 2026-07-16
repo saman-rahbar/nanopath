@@ -132,16 +132,20 @@ class TCGATileDataset(Dataset):
         # Two parallel int32 arrays (~32 MB total for 4M tiles) shared COW across DataLoader fork-workers.
         self.shard_of = np.asarray(in_split_shard, dtype=np.int32)
         self.row_of = np.asarray(in_split_row, dtype=np.int32)
-        # Metadata guidance: one barcode -> class id map per configured factor, loaded once and
-        # shared copy-on-write across DataLoader fork-workers (same sharing pattern as
-        # shard_of/row_of). cfg.metadata.factors is a list of [factor_name, sign] pairs; sign is
-        # only used by train.py (M+ encourage / M- suppress via GradScale), not here.
+        # Metadata guidance: barcode -> value maps loaded once and shared copy-on-write across
+        # DataLoader fork-workers (same sharing pattern as shard_of/row_of). cfg.metadata has two
+        # lists of [factor_name, sign] pairs: `discrete` (categorical -> class-id, cross-entropy)
+        # and `continuous` (numeric vector -> z-scored regression). sign is only used by train.py
+        # (M+ encourage / M- suppress via GradScale), not here.
         metadata_cfg = cfg.get("metadata") or {}
         self.metadata_enabled = bool(metadata_cfg.get("enabled"))
         if self.metadata_enabled:
             meta = json.loads((dataset_dir / "fino_meta.json").read_text())
-            self.metadata_factors = [name for name, _ in metadata_cfg["factors"]]
-            self.metadata_factor_labels = {name: meta["discrete"][name] for name in self.metadata_factors}
+            self.metadata_discrete = [name for name, _ in metadata_cfg.get("discrete", [])]
+            self.metadata_continuous = [name for name, _ in metadata_cfg.get("continuous", [])]
+            self.discrete_labels = {name: meta["discrete"][name] for name in self.metadata_discrete}
+            self.continuous_values = {name: meta["continuous"][name] for name in self.metadata_continuous}
+            self.continuous_dims = {name: meta["cont_dim"][name] for name in self.metadata_continuous}
         mean, std = data["mean"], data["std"]
         self.global_views = int(train["global_views"])
         self.local_views = int(train["local_views"])
@@ -217,18 +221,23 @@ class TCGATileDataset(Dataset):
         # Augmentations are stochastic per view; reproducibility comes from worker seeds.
         global_views = torch.stack([self.global_aug(tile) for _ in range(self.global_views)])
         local_views = torch.stack([self.local_aug(tile) for _ in range(self.local_views)])
-        # One label per configured factor, -1 = no label for this patient; train.py masks those
-        # out of that factor's loss term. Fixed factor order (self.metadata_factors) so train.py
-        # can index columns by position.
-        if self.metadata_enabled:
-            metadata_labels = [self.metadata_factor_labels[name].get(patient_id, -1) for name in self.metadata_factors]
-        else:
-            metadata_labels = [-1]
-        return {
+        # Discrete: one class id per factor (-1 = no label for this patient). Continuous: one
+        # value vector per factor keyed by name (nan-filled if missing). train.py masks missing
+        # entries out of each factor's loss. Fixed factor order so train.py can index by position.
+        out = {
             "global_views": global_views,
             "local_views": local_views,
             "sample_idx": torch.tensor(int(idx), dtype=torch.int64),
             "slide_id": torch.tensor(slide_key, dtype=torch.int64),
             "patient_id": torch.tensor(patient_key, dtype=torch.int64),
-            "metadata_labels": torch.tensor(metadata_labels, dtype=torch.int64),
         }
+        if self.metadata_enabled:
+            disc = [self.discrete_labels[name].get(patient_id, -1) for name in self.metadata_discrete] or [-1]
+            out["metadata_labels"] = torch.tensor(disc, dtype=torch.int64)
+            for name in self.metadata_continuous:
+                v = self.continuous_values[name].get(patient_id)
+                v = [float("nan")] * self.continuous_dims[name] if v is None else (v if isinstance(v, list) else [v])
+                out[f"metacont_{name}"] = torch.tensor(v, dtype=torch.float32)
+        else:
+            out["metadata_labels"] = torch.tensor([-1], dtype=torch.int64)
+        return out

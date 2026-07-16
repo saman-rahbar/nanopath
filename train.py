@@ -2,10 +2,12 @@
 # DINO CLS self-distillation (Sinkhorn-Knopp centred teacher targets),
 # I-JEPA patch-feature regression on contiguous block masks, a KDE uniformity
 # term on the L2-normalised CLS tokens, and optional per-factor metadata
-# classification losses (e.g. cancer subtype, imaging scanner) gated by a
-# DANN-style gradient ramp -- each factor has a sign (+1 M+ encourage /
-# -1 M- suppress via gradient reversal) and a shared small loss weight so the
-# auxiliary signal stays gentle relative to the main dino/jepa objectives.
+# guidance losses -- discrete factors (e.g. cancer subtype) via cross-entropy
+# and continuous factors (e.g. gene-expression expr512, fraction-genome-altered
+# fga) via smooth-L1 regression -- gated by a DANN-style gradient ramp. Each
+# factor has a sign (+1 M+ encourage / -1 M- suppress via gradient reversal) and
+# a shared small loss weight so the auxiliary signal stays gentle relative to
+# the main dino/jepa objectives.
 # YAML drives the tunable knobs (backbone variant, LR + LR scheduler, drop
 # path, layerwise decay, KDE weight + concentration, JEPA predictor/mask
 # shape, metadata factors, FLOP/sample budgets, batch size); other DINOv2
@@ -41,7 +43,7 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import TCGATileDataset, TILE_SIZE
-from model import DINOHead, DinoV2ViT, GradScale, JEPAPredictor, MetadataClassifier, load_dinov2_pretrained
+from model import DINOHead, DinoV2ViT, GradScale, JEPAPredictor, MetadataClassifier, MetadataRegressor, load_dinov2_pretrained
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -235,15 +237,18 @@ def main():
     labless_autosubmit_file = maybe_arm_labless_autosubmit(cfg, repo_dir)
     train_cfg = cfg["train"]
     dino_cfg = cfg["dino"]
-    # Metadata guidance (see dataloader.py header + model.MetadataClassifier). Each factor has a
-    # sign: +1 (M+) trains the encoder to predict it (e.g. cancer subtype -- encourages semantic
-    # signal); -1 (M-) reverses the gradient so the encoder is trained to NOT predict it (e.g.
-    # scanner -- suppresses a nuisance/robustness-hurting signal), classic DANN domain-adversarial
-    # training. gamma ramps every factor's encoder gradient from 0 to gamma_max over the run
-    # (DANN-style sigmoid ramp) so the auxiliary signal doesn't destabilize early training.
+    # Metadata guidance (see dataloader.py header + model.py heads). Two factor lists, each of
+    # [name, sign]: `discrete` (categorical -> cross-entropy classifier) and `continuous` (numeric
+    # vector -> smooth-L1 regressor). sign is +1 (M+, encourage the encoder to predict the factor)
+    # or -1 (M-, reverse the gradient to suppress it). Round-3 uses subtype(+1), expr512(+1),
+    # fga(+1): positive molecular grounding -- gene expression / genomic instability are measured
+    # from bulk assay independent of the H&E scanner, so predicting them anchors the encoder to
+    # scanner-invariant biology. gamma ramps every factor's encoder gradient 0 -> gamma_max over
+    # the run (DANN-style sigmoid ramp) so the auxiliary signal doesn't destabilize early training.
     metadata_cfg = cfg.get("metadata") or {}
     metadata_enabled = bool(metadata_cfg.get("enabled"))
-    metadata_factors = [(name, float(sign)) for name, sign in metadata_cfg.get("factors", [])] if metadata_enabled else []
+    metadata_discrete = [(name, float(sign)) for name, sign in metadata_cfg.get("discrete", [])] if metadata_enabled else []
+    metadata_continuous = [(name, float(sign)) for name, sign in metadata_cfg.get("continuous", [])] if metadata_enabled else []
     save_every = train_cfg["save_every"]
     save_checkpoints = save_every is not None
     device = torch.device("cuda")
@@ -266,16 +271,20 @@ def main():
     # I-JEPA predictor has no teacher/EMA counterpart: it directly regresses the (already-EMA)
     # teacher backbone's patch features, so only the student side needs to exist.
     student_predictor = JEPAPredictor(student_backbone.embed_dim, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"])).to(device)
-    student_metadata_heads = nn.ModuleDict()  # one classifier per metadata factor, empty unless metadata.enabled
+    # One classifier per discrete factor + one regressor per continuous factor; both empty unless
+    # metadata.enabled. A single ModuleDict holds all of them so checkpoint/train/eval treat them uniformly.
+    student_metadata_heads = nn.ModuleDict()
     backbone_activated_params = sum(p.numel() for p in student_backbone.parameters() if p.requires_grad)
     # AdamW param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD).
     param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"])
     if metadata_enabled:
-        # dataloader.py independently reads the same file for its own per-tile label lookup;
-        # here we only need each factor's class count to size its classifier head.
+        # dataloader.py independently reads the same file for its own per-tile lookup; here we only
+        # need each factor's class count / vector dim to size its head.
         metadata_meta = json.loads((Path(cfg["data"]["dataset_dir"]) / "fino_meta.json").read_text())
-        for name, _ in metadata_factors:
+        for name, _ in metadata_discrete:
             student_metadata_heads[name] = MetadataClassifier(student_backbone.embed_dim, metadata_meta["n"][name]).to(device)
+        for name, _ in metadata_continuous:
+            student_metadata_heads[name] = MetadataRegressor(student_backbone.embed_dim, metadata_meta["cont_dim"][name]).to(device)
         param_groups.append({"params": list(student_metadata_heads.parameters()), "lr_mult": 1.0, "wd_mult": 1.0, "last_layer": False})
     opt = torch.optim.AdamW(param_groups, lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]))
     step = 0
@@ -447,8 +456,8 @@ def main():
 
     # Compute (dino_loss, jepa_loss, kde, metadata_loss) for one batch of (gf, lf) crops with the
     # given masks + schedule values. Used by both the train step and evaluate() (no_grad).
-    # `meta=(gamma, labels)` is None unless metadata.enabled; labels has shape (b, n_factors),
-    # -1 entries are masked out of that factor's loss.
+    # `meta=(gamma, labels, conts)` is None unless metadata.enabled: labels (b, n_disc) int with
+    # -1 = missing; conts {name: (b, dim) float} with nan = missing. Missing entries are masked out.
     def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None):
         with torch.no_grad():
             t = teacher_backbone(gf)
@@ -468,21 +477,27 @@ def main():
         kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
         metadata_loss = sg["x_norm_clstoken"].new_zeros(())
         if meta is not None:
-            gamma, labels = meta
+            gamma, labels, conts = meta
+            cls = sg["x_norm_clstoken"]
+            # metadata_loss_weight keeps each factor a gentle auxiliary signal relative to the main
+            # dino/jepa objectives, not a competing one -- round 2 omitted this and the unweighted
+            # metadata loss reached dino+jepa+kde magnitude, hurting the primary representation.
+            # GradScale ramps the encoder gradient in gradually (gamma: 0 -> gamma_max), sign flips
+            # it: +1 (M+) encourages predicting the factor, -1 (M-) reverses to suppress it.
+            weight = dino_cfg["metadata_loss_weight"]
             labels = labels.repeat(train_cfg["global_views"], 1)
-            # metadata_loss_weight keeps each factor a gentle auxiliary signal relative to the
-            # main dino/jepa objectives, not a competing one -- an earlier run omitted this and
-            # the (unweighted) metadata loss ended up comparable in magnitude to dino+jepa+kde
-            # combined, likely hurting the primary representation more than the factor helped it.
-            for j, (name, sign) in enumerate(metadata_factors):
+            for j, (name, sign) in enumerate(metadata_discrete):
                 col = labels[:, j]
                 valid = col >= 0
                 if valid.any():
-                    # GradScale ramps the encoder gradient in gradually (gamma: 0 -> gamma_max
-                    # over the run), and sign flips it: +1 encourages predicting the factor
-                    # (M+), -1 reverses the gradient to suppress it (M-, DANN-style).
-                    logits = student_metadata_heads[name](GradScale.apply(sg["x_norm_clstoken"][valid], sign * gamma))
-                    metadata_loss = metadata_loss + dino_cfg["metadata_loss_weight"] * F.cross_entropy(logits, col[valid])
+                    logits = student_metadata_heads[name](GradScale.apply(cls[valid], sign * gamma))
+                    metadata_loss = metadata_loss + weight * F.cross_entropy(logits, col[valid])
+            for name, sign in metadata_continuous:
+                target = conts[name].repeat(train_cfg["global_views"], 1)
+                valid = ~torch.isnan(target).any(dim=1)
+                if valid.any():
+                    pred = student_metadata_heads[name](GradScale.apply(cls[valid], sign * gamma))
+                    metadata_loss = metadata_loss + weight * F.smooth_l1_loss(pred, target[valid])
         return local_loss + global_loss, jepa_loss, kde, metadata_loss
 
     # Held-out validation pass: same DINO + JEPA + KDE + metadata losses on `val_batches` of the
@@ -508,7 +523,8 @@ def main():
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = make_block_mask(b * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
-                eval_meta = (dino_cfg["metadata_gamma_max"], vbatch["metadata_labels"].to(device, non_blocking=True)) if metadata_enabled else None
+                eval_meta = (dino_cfg["metadata_gamma_max"], vbatch["metadata_labels"].to(device, non_blocking=True),
+                             {n: vbatch[f"metacont_{n}"].to(device, non_blocking=True) for n, _ in metadata_continuous}) if metadata_enabled else None
                 dino_l, jepa_l, kde_v, meta_l = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale, meta=eval_meta)
             sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(meta_l), float(dino_l + jepa_l + kde_v + meta_l)], device=device)
             n_batches += 1
@@ -608,7 +624,8 @@ def main():
             metadata_meta_arg = None
             if metadata_enabled:
                 gamma = dino_cfg["metadata_gamma_max"] * (2.0 / (1.0 + math.exp(-10.0 * sample_frac)) - 1.0)
-                metadata_meta_arg = (gamma, batch["metadata_labels"].to(device, non_blocking=True))
+                metadata_meta_arg = (gamma, batch["metadata_labels"].to(device, non_blocking=True),
+                                     {n: batch[f"metacont_{n}"].to(device, non_blocking=True) for n, _ in metadata_continuous})
             # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
             # subsequent steps reuse measured_flops_per_step (fixed shapes => fixed cost).
             flop_ctx = FlopCounterMode(display=False) if measured_flops_per_step is None else contextlib.nullcontext()
