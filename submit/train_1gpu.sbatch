@@ -7,7 +7,9 @@
 #SBATCH --error=slurm/%j.err
 #SBATCH --account=def-ssfels
 #SBATCH --gres=gpu:a100:1 # train.bf16=true in configs/*.yaml needs Ampere+ (sm80); v100 (Volta) has no native bf16
-#SBATCH --mem=64G # system RAM for the 16 dataloader workers, not GPU VRAM (that's --gres)
+#SBATCH --mem=120G # system RAM for the dataloader workers, not GPU VRAM (that's --gres). Narval
+# A100 nodes have ~124G per GPU. 64G OOM'd (MaxRSS 64.0GiB) once local_size hit 112: batch 128 x
+# prefetch 2 x 16 workers keeps ~4k samples in flight per loader, and train+val each run 16 workers.
 #SBATCH --time=06:00:00 # configs/main.yaml budget on a single A100; smoke.yaml finishes in minutes and exits early
 
 set -euo pipefail
